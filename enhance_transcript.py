@@ -2,10 +2,10 @@
 Enhance transcripts using GPT-5.1 with dental-focused Finnish dictionary.
 
 Strategy:
-- Read transcripts from 'transcripts/' directory
+- Read transcripts from a directory
 - Use GPT-5.1 to correct spelling, capitalization, and inflection
 - CONSTRAINT: Do NOT add or remove words
-- Save enhanced versions to 'enhanced/' directory
+- Save enhanced versions to an output directory
 """
 
 import sys

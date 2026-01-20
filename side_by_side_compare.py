@@ -1,3 +1,10 @@
+"""
+Compare hypothesis transcripts against reference transcripts.
+
+Generates per-file evaluation reports including WER and other metrics and
+side-by-side aligned output.
+"""
+
 import sys
 from pathlib import Path
 
