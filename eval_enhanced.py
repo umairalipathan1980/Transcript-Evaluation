@@ -1,14 +1,39 @@
+# Command: python eval_enhanced.py <reference_dir> <hypotheses_root_dir> <enhanced_root_dir> [output_xlsx]
 """
-Batch evaluation comparing original vs enhanced transcripts.
+Batch evaluation comparing original and enhanced transcripts for all model folders.
 
-Computes WER, CER, and Spelling Error Rate for both versions.
+Reads:
+- reference transcripts from a CLI-provided reference directory
+- original hypotheses from each subfolder in a CLI-provided hypotheses root
+- enhanced transcripts from a CLI-provided enhanced root under "<model_name>_enhanced/"
+
+Outputs:
+- CLI table, row printed after each model evaluation
+- Excel file with the same table
 """
 
 import sys
 from pathlib import Path
 
 import jiwer
+from openpyxl import Workbook
 from rapidfuzz.distance import Levenshtein
+
+DEFAULT_OUTPUT_XLSX = Path(__file__).resolve().parent / "output_general.xlsx"
+
+TABLE_HEADERS = [
+    "Model",
+    "Original WER",
+    "Enhanced WER",
+    "Original Spelling",
+    "Enhanced Spelling",
+    "Original Substitution",
+    "Enhanced Substitution",
+    "Original Deletion",
+    "Enhanced Deletion",
+    "Original Insertion",
+    "Enhanced Insertion",
+]
 
 
 def _build_transform():
@@ -19,18 +44,6 @@ def _build_transform():
             jiwer.RemoveMultipleSpaces(),
             jiwer.Strip(),
             jiwer.ReduceToListOfListOfWords(),
-        ]
-    )
-
-
-def _build_char_transform():
-    return jiwer.Compose(
-        [
-            jiwer.ToLowerCase(),
-            jiwer.RemovePunctuation(),
-            jiwer.RemoveMultipleSpaces(),
-            jiwer.Strip(),
-            jiwer.ReduceToListOfListOfChars(),
         ]
     )
 
@@ -58,213 +71,241 @@ def _spelling_error_count(output, max_normalized_distance=0.4):
             for i in range(pair_len):
                 ref_word = ref_span[i]
                 hyp_word = hyp_span[i]
-                max_len = max(len(ref_word), len(hyp_word))
-                if max_len == 0:
-                    continue
                 if _is_spelling_error(
                     ref_word, hyp_word, max_normalized_distance=max_normalized_distance
                 ):
                     spelling_errors += 1
-
     return spelling_errors
 
 
 def _evaluate_texts(reference_text, hypothesis_text):
     word_transform = _build_transform()
-    char_transform = _build_char_transform()
-    word_output = jiwer.process_words(
+    return jiwer.process_words(
         reference_text,
         hypothesis_text,
         reference_transform=word_transform,
         hypothesis_transform=word_transform,
     )
-    char_output = jiwer.process_characters(
-        reference_text,
-        hypothesis_text,
-        reference_transform=char_transform,
-        hypothesis_transform=char_transform,
-    )
-    return word_output, char_output
 
-def evaluate_batch(reference_dir: str, original_dir: str, enhanced_dir: str):
-    """
-    Evaluate original and enhanced transcripts against ground truth.
 
-    Args:
-        reference_dir: Directory with ground truth transcripts
-        original_dir: Directory with original ASR transcripts
-        enhanced_dir: Directory with GPT-enhanced transcripts
-    """
-    ref_path = Path(reference_dir)
-    orig_path = Path(original_dir)
-    enh_path = Path(enhanced_dir)
+def _init_totals():
+    return {
+        "subs": 0,
+        "dels": 0,
+        "ins": 0,
+        "ref_words": 0,
+        "spelling_errors": 0,
+    }
 
-    if not ref_path.exists():
-        raise FileNotFoundError(f"Reference directory not found: {ref_path}")
-    if not orig_path.exists():
-        raise FileNotFoundError(f"Original directory not found: {orig_path}")
-    if not enh_path.exists():
-        raise FileNotFoundError(f"Enhanced directory not found: {enh_path}")
 
-    # Collect original stats
-    orig_total_subs = 0
-    orig_total_dels = 0
-    orig_total_ins = 0
-    orig_total_ref_words = 0
-    orig_total_spelling_errors = 0
-    orig_total_char_subs = 0
-    orig_total_char_dels = 0
-    orig_total_char_ins = 0
-    orig_total_ref_chars = 0
+def _update_totals(totals, output):
+    totals["subs"] += output.substitutions
+    totals["dels"] += output.deletions
+    totals["ins"] += output.insertions
+    totals["ref_words"] += output.hits + output.substitutions + output.deletions
+    totals["spelling_errors"] += _spelling_error_count(output)
 
-    # Collect enhanced stats
-    enh_total_subs = 0
-    enh_total_dels = 0
-    enh_total_ins = 0
-    enh_total_ref_words = 0
-    enh_total_spelling_errors = 0
-    enh_total_char_subs = 0
-    enh_total_char_dels = 0
-    enh_total_char_ins = 0
-    enh_total_ref_chars = 0
 
+def _rates(totals):
+    ref_words = totals["ref_words"]
+    if ref_words == 0:
+        return {
+            "wer": 0.0,
+            "spelling": 0.0,
+            "substitution": 0.0,
+            "deletion": 0.0,
+            "insertion": 0.0,
+        }
+    return {
+        "wer": (totals["subs"] + totals["dels"] + totals["ins"]) / ref_words,
+        "spelling": totals["spelling_errors"] / ref_words,
+        "substitution": totals["subs"] / ref_words,
+        "deletion": totals["dels"] / ref_words,
+        "insertion": totals["ins"] / ref_words,
+    }
+
+
+def _format_model_name(folder_name: str) -> str:
+    if folder_name.startswith("WhisperX-"):
+        return f"WhisperX ({folder_name.split('-', 1)[1]})"
+    if folder_name.startswith("whisperx-"):
+        return f"WhisperX ({folder_name.split('-', 1)[1]})"
+    return folder_name
+
+
+def _fmt_percent(value: float) -> str:
+    return f"{value:.2%}"
+
+
+def _evaluate_model(reference_dir: Path, original_dir: Path, enhanced_dir: Path):
+    orig_totals = _init_totals()
+    enh_totals = _init_totals()
     evaluated = 0
-    improved = 0
-    degraded = 0
-    unchanged = 0
 
-    print("=" * 80)
-    print("EVALUATING ORIGINAL VS ENHANCED TRANSCRIPTS")
-    print("=" * 80)
-    print()
-
-    for ref_file in sorted(ref_path.glob("*.txt")):
-        stem = ref_file.stem
-        orig_file = orig_path / ref_file.name
-        enh_file = enh_path / ref_file.name
-
-        if not orig_file.exists():
-            print(f"WARNING: Missing original: {orig_file.name}")
+    for ref_file in sorted(reference_dir.glob("*.txt")):
+        original_file = original_dir / ref_file.name
+        enhanced_file = enhanced_dir / ref_file.name
+        if not original_file.exists() or not enhanced_file.exists():
             continue
 
-        if not enh_file.exists():
-            print(f"WARNING: Missing enhanced: {enh_file.name}")
-            continue
-
-        # Read texts
         ref_text = ref_file.read_text(encoding="utf-8")
-        orig_text = orig_file.read_text(encoding="utf-8")
-        enh_text = enh_file.read_text(encoding="utf-8")
+        orig_text = original_file.read_text(encoding="utf-8")
+        enh_text = enhanced_file.read_text(encoding="utf-8")
 
-        # Evaluate original
-        orig_output, orig_cer_output = _evaluate_texts(ref_text, orig_text)
-        orig_wer = orig_output.wer
-
-        # Evaluate enhanced
-        enh_output, enh_cer_output = _evaluate_texts(ref_text, enh_text)
-        enh_wer = enh_output.wer
-
-        # Track stats
-        orig_total_subs += orig_output.substitutions
-        orig_total_dels += orig_output.deletions
-        orig_total_ins += orig_output.insertions
-        orig_total_ref_words += orig_output.hits + orig_output.substitutions + orig_output.deletions
-        orig_total_spelling_errors += _spelling_error_count(orig_output)
-        orig_total_char_subs += orig_cer_output.substitutions
-        orig_total_char_dels += orig_cer_output.deletions
-        orig_total_char_ins += orig_cer_output.insertions
-        orig_total_ref_chars += orig_cer_output.hits + orig_cer_output.substitutions + orig_cer_output.deletions
-
-        enh_total_subs += enh_output.substitutions
-        enh_total_dels += enh_output.deletions
-        enh_total_ins += enh_output.insertions
-        enh_total_ref_words += enh_output.hits + enh_output.substitutions + enh_output.deletions
-        enh_total_spelling_errors += _spelling_error_count(enh_output)
-        enh_total_char_subs += enh_cer_output.substitutions
-        enh_total_char_dels += enh_cer_output.deletions
-        enh_total_char_ins += enh_cer_output.insertions
-        enh_total_ref_chars += enh_cer_output.hits + enh_cer_output.substitutions + enh_cer_output.deletions
-
+        orig_output = _evaluate_texts(ref_text, orig_text)
+        enh_output = _evaluate_texts(ref_text, enh_text)
+        _update_totals(orig_totals, orig_output)
+        _update_totals(enh_totals, enh_output)
         evaluated += 1
 
-        # Determine improvement/degradation
-        diff = orig_wer - enh_wer
-        if diff > 0.001:  # Improved
-            status = "IMPROVED"
-            improved += 1
-        elif diff < -0.001:  # Degraded
-            status = "DEGRADED"
-            degraded += 1
-        else:  # Unchanged
-            status = "SAME"
-            unchanged += 1
-
-        print(f"{stem:40s} | Orig: {orig_wer:6.2%} | Enh: {enh_wer:6.2%} | Delta: {diff:+.2%} | {status}")
-
     if evaluated == 0:
-        print("No files evaluated.")
-        return
+        return None
 
-    # Compute aggregate metrics
-    orig_wer = (orig_total_subs + orig_total_dels + orig_total_ins) / orig_total_ref_words
-    enh_wer = (enh_total_subs + enh_total_dels + enh_total_ins) / enh_total_ref_words
+    orig_rates = _rates(orig_totals)
+    enh_rates = _rates(enh_totals)
+    return {
+        "evaluated_files": evaluated,
+        "original": orig_rates,
+        "enhanced": enh_rates,
+    }
 
-    orig_cer = (orig_total_char_subs + orig_total_char_dels + orig_total_char_ins) / orig_total_ref_chars if orig_total_ref_chars else 0
-    enh_cer = (enh_total_char_subs + enh_total_char_dels + enh_total_char_ins) / enh_total_ref_chars if enh_total_ref_chars else 0
 
-    orig_spelling_rate = orig_total_spelling_errors / orig_total_ref_words
-    enh_spelling_rate = enh_total_spelling_errors / enh_total_ref_words
+def _build_row(model_name: str, metrics: dict):
+    return [
+        model_name,
+        _fmt_percent(metrics["original"]["wer"]),
+        _fmt_percent(metrics["enhanced"]["wer"]),
+        _fmt_percent(metrics["original"]["spelling"]),
+        _fmt_percent(metrics["enhanced"]["spelling"]),
+        _fmt_percent(metrics["original"]["substitution"]),
+        _fmt_percent(metrics["enhanced"]["substitution"]),
+        _fmt_percent(metrics["original"]["deletion"]),
+        _fmt_percent(metrics["enhanced"]["deletion"]),
+        _fmt_percent(metrics["original"]["insertion"]),
+        _fmt_percent(metrics["enhanced"]["insertion"]),
+    ]
 
-    orig_sub_rate = orig_total_subs / orig_total_ref_words
-    enh_sub_rate = enh_total_subs / enh_total_ref_words
 
-    orig_del_rate = orig_total_dels / orig_total_ref_words
-    enh_del_rate = enh_total_dels / enh_total_ref_words
+def _compute_col_widths(headers, rows):
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for i, value in enumerate(row):
+            widths[i] = max(widths[i], len(str(value)))
+    return widths
 
-    orig_ins_rate = orig_total_ins / orig_total_ref_words
-    enh_ins_rate = enh_total_ins / enh_total_ref_words
 
-    print()
-    print("=" * 80)
-    print("SUMMARY")
-    print("=" * 80)
-    print(f"Files evaluated:     {evaluated}")
-    print(f"  Improved:          {improved}")
-    print(f"  Degraded:          {degraded}")
-    print(f"  Unchanged:         {unchanged}")
-    print()
+def _format_row(row, widths, numeric_cols=None):
+    numeric_cols = numeric_cols or set()
+    cells = []
+    for i, (value, width) in enumerate(zip(row, widths)):
+        text = str(value)
+        cells.append(text.rjust(width) if i in numeric_cols else text.ljust(width))
+    return "| " + " | ".join(cells) + " |"
 
-    print("=" * 80)
-    print("AGGREGATE METRICS")
-    print("=" * 80)
-    print(f"{'Metric':<30s} | {'Original':>10s} | {'Enhanced':>10s} | {'Change':>10s}")
-    print("-" * 80)
-    print(f"{'Word Error Rate (WER)':<30s} | {orig_wer:>10.2%} | {enh_wer:>10.2%} | {(enh_wer - orig_wer):>+10.2%}")
-    print(f"{'Character Error Rate (CER)':<30s} | {orig_cer:>10.2%} | {enh_cer:>10.2%} | {(enh_cer - orig_cer):>+10.2%}")
-    print(f"{'Spelling Error Rate':<30s} | {orig_spelling_rate:>10.2%} | {enh_spelling_rate:>10.2%} | {(enh_spelling_rate - orig_spelling_rate):>+10.2%}")
-    print(f"{'Substitution Rate':<30s} | {orig_sub_rate:>10.2%} | {enh_sub_rate:>10.2%} | {(enh_sub_rate - orig_sub_rate):>+10.2%}")
-    print(f"{'Deletion Rate':<30s} | {orig_del_rate:>10.2%} | {enh_del_rate:>10.2%} | {(enh_del_rate - orig_del_rate):>+10.2%}")
-    print(f"{'Insertion Rate':<30s} | {orig_ins_rate:>10.2%} | {enh_ins_rate:>10.2%} | {(enh_ins_rate - orig_ins_rate):>+10.2%}")
-    print("=" * 80)
 
-    if enh_wer < orig_wer:
-        improvement = (orig_wer - enh_wer) * 100
-        print(f"\n>>> Overall WER improved by {improvement:.2f} percentage points!")
-    elif enh_wer > orig_wer:
-        degradation = (enh_wer - orig_wer) * 100
-        print(f"\n>>> Overall WER degraded by {degradation:.2f} percentage points.")
-    else:
-        print("\n>>> Overall WER unchanged.")
+def _print_table(headers, rows):
+    numeric_cols = set(range(1, len(headers)))
+    widths = _compute_col_widths(headers, rows)
+    separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
+
+    print(separator)
+    print(_format_row(headers, widths))
+    print(separator)
+    for row in rows:
+        print(_format_row(row, widths, numeric_cols=numeric_cols))
+    print(separator)
+
+
+def _save_xlsx(rows, output_xlsx: Path):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "evaluation"
+    ws.append(TABLE_HEADERS)
+    for row in rows:
+        ws.append(row)
+    output_xlsx.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output_xlsx)
+
+
+def _average_enhancements(metrics_list):
+    count = len(metrics_list)
+    return {
+        "wer": sum(m["original"]["wer"] - m["enhanced"]["wer"] for m in metrics_list) / count,
+        "spelling": sum(m["original"]["spelling"] - m["enhanced"]["spelling"] for m in metrics_list) / count,
+        "substitution": sum(m["original"]["substitution"] - m["enhanced"]["substitution"] for m in metrics_list) / count,
+        "deletion": sum(m["original"]["deletion"] - m["enhanced"]["deletion"] for m in metrics_list) / count,
+        "insertion": sum(m["original"]["insertion"] - m["enhanced"]["insertion"] for m in metrics_list) / count,
+    }
+
 
 def main():
-    if len(sys.argv) != 4:
-        print("Usage: python eval_enhanced.py <reference_dir> <original_dir> <enhanced_dir>")
-        print()
-        print("Example:")
-        print('  python eval_enhanced.py "C:\\Users\\h02317\\Downloads\\transcripts" transcripts enhanced')
+    if len(sys.argv) not in (4, 5):
+        print(
+            "Usage: python eval_enhanced.py "
+            "<reference_dir> <hypotheses_root_dir> <enhanced_root_dir> [output_xlsx]"
+        )
         sys.exit(1)
 
-    evaluate_batch(sys.argv[1], sys.argv[2], sys.argv[3])
+    reference_dir = Path(sys.argv[1])
+    hypothesis_root = Path(sys.argv[2])
+    enhanced_root_dir = Path(sys.argv[3])
+    output_xlsx = Path(sys.argv[4]) if len(sys.argv) == 5 else DEFAULT_OUTPUT_XLSX
+    if not output_xlsx.is_absolute():
+        output_xlsx = Path(__file__).resolve().parent / output_xlsx
+
+    if not reference_dir.exists():
+        raise FileNotFoundError(f"Reference directory not found: {reference_dir}")
+    if not hypothesis_root.exists():
+        raise FileNotFoundError(f"Hypothesis root directory not found: {hypothesis_root}")
+    if not enhanced_root_dir.exists():
+        raise FileNotFoundError(f"Enhanced root directory not found: {enhanced_root_dir}")
+
+    model_dirs = sorted([p for p in hypothesis_root.iterdir() if p.is_dir()])
+    if not model_dirs:
+        print(f"No model directories found in {hypothesis_root}")
+        return
+
+    rows = []
+    metrics_list = []
+
+    print(f"Reference directory: {reference_dir}")
+    print(f"Hypothesis root:     {hypothesis_root}")
+    print(f"Enhanced root:       {enhanced_root_dir}")
+    print()
+
+    for model_dir in model_dirs:
+        enhanced_dir = enhanced_root_dir / f"{model_dir.name}_enhanced"
+        if not enhanced_dir.exists():
+            print(f"Skipping {model_dir.name}: missing {enhanced_dir}")
+            continue
+
+        metrics = _evaluate_model(reference_dir, model_dir, enhanced_dir)
+        if metrics is None:
+            print(f"Skipping {model_dir.name}: no matching reference/original/enhanced files")
+            continue
+
+        row = _build_row(_format_model_name(model_dir.name), metrics)
+        rows.append(row)
+        metrics_list.append(metrics)
+
+    if not rows:
+        print("\nNo model rows were produced.")
+        return
+
+    _print_table(TABLE_HEADERS, rows)
+
+    avg = _average_enhancements(metrics_list)
+    print()
+    print("Average enhancement summary:")
+    print(f"  Average WER enhancement:          {avg['wer']:+.2%}")
+    print(f"  Average spelling enhancement:     {avg['spelling']:+.2%}")
+    print(f"  Average substitution enhancement: {avg['substitution']:+.2%}")
+    print(f"  Average deletion enhancement:     {avg['deletion']:+.2%}")
+    print(f"  Average insertion enhancement:    {avg['insertion']:+.2%}")
+
+    _save_xlsx(rows, output_xlsx)
+    print(f"\nSaved: {output_xlsx}")
+
 
 if __name__ == "__main__":
     main()
